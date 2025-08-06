@@ -13,7 +13,7 @@ on:
           - stage
           - production
       create_resources:
-        description: 'Create Azure resources if they don\'t exist'
+        description: 'Create Azure resources if they do not exist'
         required: true
         default: false
         type: boolean
