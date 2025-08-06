@@ -1,0 +1,154 @@
+name: Azure deployment
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  packages: write
+  attestations: write
+  id-token: write
+  contents: write
+  pull-requests: write
+
+env:
+  IMAGE_REGISTRY_URL: ghcr.io
+  DOCKER_IMAGE_NAME: azure-go-test-web-app
+  AZURE_WEBAPP_NAME: azure-go-test-web-app
+  AZURE_RESOURCE_GROUP: cd-with-actions
+  AZURE_APP_PLAN: azure-test-deployment
+  AZURE_LOCATION: '"East US"'
+
+jobs:
+  build:
+    if: contains(github.event.pull_request.labels.*.name, 'stage')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 16
+      - name: npm install and build webpack
+        run: |
+          npm install
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webpack artifacts
+          path: public/
+
+  Build-Docker-Image:
+    runs-on: ubuntu-latest
+    needs: build
+    name: Build image and store in GitHub Container Registry
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download built artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webpack artifacts
+          path: public
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IMAGE_REGISTRY_URL }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{env.IMAGE_REGISTRY_URL}}/${{ github.repository }}/${{env.DOCKER_IMAGE_NAME}}
+          tags: |
+            type=sha,format=long,prefix=
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  Deploy-to-Azure:
+    if: contains(github.event.pull_request.labels.*.name, 'stage')
+    runs-on: ubuntu-latest
+    needs: [Build-Docker-Image]
+    name: Deploy app container to Azure
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: "Login via Azure CLI"
+        uses: azure/login@v1
+        with:
+          creds: '${{ secrets.AZURE_CREDENTIALS }}'
+      - uses: azure/docker-login@v1
+        with:
+          login-server: ${{env.IMAGE_REGISTRY_URL}}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create Azure resource group
+        if: contains(github.event.pull_request.labels.*.name, 'stage') && contains(github.event.pull_request.labels.*.name, 'spin up environment')
+        run: |
+          EXISTS=$(az group exists --name ${{env.AZURE_RESOURCE_GROUP}})
+          if [ "$EXISTS" = true ]; then
+            echo "Resource group ${{env.AZURE_RESOURCE_GROUP}} exists."
+          else
+            az group create --location ${{env.AZURE_LOCATION}} --name ${{env.AZURE_RESOURCE_GROUP}} --subscription ${{secrets.AZURE_SUBSCRIPTION_ID}}
+            echo "Resource group ${{env.AZURE_RESOURCE_GROUP}} created."
+          fi
+      - name: Create Azure app service plan
+        if: contains(github.event.pull_request.labels.*.name, 'stage') && contains(github.event.pull_request.labels.*.name, 'spin up environment')
+        run: |
+          APP_SERVICE_PLAN_NAME=${{env.AZURE_APP_PLAN}}
+          appservice_plans=$(az appservice plan list --resource-group ${{env.AZURE_RESOURCE_GROUP}} --query "[?name=='$APP_SERVICE_PLAN_NAME']")
+          if [[ $(echo "$appservice_plans" | jq length) -gt 0 ]]; then
+            echo "App Service Plan '$APP_SERVICE_PLAN_NAME' exists in resource group ${{env.AZURE_RESOURCE_GROUP}}."
+          else
+             az appservice plan create --resource-group ${{env.AZURE_RESOURCE_GROUP}} --name ${{env.AZURE_APP_PLAN}} --is-linux --sku F1 --subscription ${{secrets.AZURE_SUBSCRIPTION_ID}}
+            echo "App service plan ${{env.AZURE_APP_PLAN}} created."
+          fi
+
+      - name: Create webapp resource
+        if: contains(github.event.pull_request.labels.*.name, 'stage') && contains(github.event.pull_request.labels.*.name, 'spin up environment')
+        run: |
+          WEB_APP_NAME=${{ env.AZURE_WEBAPP_NAME }}
+          web_apps=$(az webapp list --resource-group ${{env.AZURE_RESOURCE_GROUP}} --query "[?name=='$WEB_APP_NAME']")
+          if [[ $(echo "$web_apps" | jq length) -gt 0 ]]; then
+            echo "Web app '$WEB_APP_NAME' exists in resource group ${{env.AZURE_RESOURCE_GROUP}}."
+          else
+            az webapp create --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --plan ${{ env.AZURE_APP_PLAN }} --name ${{ env.AZURE_WEBAPP_NAME }}  --deployment-container-image-name nginx --subscription ${{secrets.AZURE_SUBSCRIPTION_ID}}
+            az webapp config container set --docker-custom-image-name nginx --docker-registry-server-password ${{secrets.CR_PAT}} --docker-registry-server-url https://${{env.IMAGE_REGISTRY_URL}} --docker-registry-server-user ${{github.actor}} --name ${{ env.AZURE_WEBAPP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --subscription ${{secrets.AZURE_SUBSCRIPTION_ID}}
+            echo "Web app ${{ env.AZURE_WEBAPP_NAME }} created in resource group ${{env.AZURE_RESOURCE_GROUP}}."
+          fi
+
+      - name: Deploy web app container
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{env.AZURE_WEBAPP_NAME}}
+          images: ${{env.IMAGE_REGISTRY_URL}}/${{ github.repository }}/${{env.DOCKER_IMAGE_NAME}}:${{ github.sha }}
+
+      - name: Check WebApp response code
+        run: |
+          webapp_url=$(az webapp show --name ${{ env.AZURE_WEBAPP_NAME }}  --resource-group ${{env.AZURE_RESOURCE_GROUP}} --query "defaultHostName" -o tsv)
+          response_code=$(curl --head --silent --output /dev/null --write-out "%{http_code}" --max-time 30 https://$webapp_url)
+          if [ $response_code -eq 200 ]; then
+            echo "$webapp_url is working fine.Merging this pull request."
+            gh pr merge ${{ github.event.pull_request.number }} --squash --auto --delete-branch
+          else
+            echo "Failed to ping $webapp_url"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Azure logout via Azure CLI
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az logout
+            az cache purge
+            az account clear
