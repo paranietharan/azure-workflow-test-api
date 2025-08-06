@@ -1,6 +1,29 @@
 name: Azure deployment
 
 on:
+  # Manual trigger with branch selection
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'stage'
+        type: choice
+        options:
+          - stage
+          - production
+      create_resources:
+        description: 'Create Azure resources if they don\'t exist'
+        required: true
+        default: false
+        type: boolean
+      branch:
+        description: 'Branch to deploy from'
+        required: true
+        default: 'main'
+        type: string
+
+  # Keep pull request trigger as backup option
   pull_request:
     types: [labeled]
 
@@ -20,12 +43,18 @@ env:
   AZURE_LOCATION: '"East US"'
 
 jobs:
-  # Option 1: Remove this job if you don't need Node.js build
   build-frontend:
-    if: contains(github.event.pull_request.labels.*.name, 'stage')
+    # Run if manually triggered OR if PR has 'stage' label
+    if: |
+      github.event_name == 'workflow_dispatch' || 
+      contains(github.event.pull_request.labels.*.name, 'stage')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout specific branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.head_ref }}
+
       - uses: actions/setup-node@v4
         with:
           node-version: 18
@@ -40,14 +69,14 @@ jobs:
 
   Build-Docker-Image:
     runs-on: ubuntu-latest
-    # Remove 'needs: build-frontend' if you removed the frontend build job
     needs: build-frontend
     name: Build image and store in GitHub Container Registry
     steps:
-      - name: Checkout
+      - name: Checkout specific branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.head_ref }}
 
-      # Remove this step if you don't have frontend build
       - name: Download built artifact
         uses: actions/download-artifact@v4
         with:
@@ -67,6 +96,7 @@ jobs:
         with:
           images: ${{env.IMAGE_REGISTRY_URL}}/${{ github.repository }}/${{env.DOCKER_IMAGE_NAME}}
           tags: |
+            type=ref,event=branch
             type=sha,format=long,prefix=
 
       - name: Build and push Docker image
@@ -78,24 +108,33 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   Deploy-to-Azure:
-    if: contains(github.event.pull_request.labels.*.name, 'stage')
+    if: |
+      github.event_name == 'workflow_dispatch' || 
+      contains(github.event.pull_request.labels.*.name, 'stage')
     runs-on: ubuntu-latest
     needs: [Build-Docker-Image]
     name: Deploy app container to Azure
     steps:
-      - name: Checkout
+      - name: Checkout specific branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.head_ref }}
+
       - name: "Login via Azure CLI"
         uses: azure/login@v1
         with:
           creds: '${{ secrets.AZURE_CREDENTIALS }}'
+
       - uses: azure/docker-login@v1
         with:
           login-server: ${{env.IMAGE_REGISTRY_URL}}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create Azure resource group
-        if: contains(github.event.pull_request.labels.*.name, 'stage') && contains(github.event.pull_request.labels.*.name, 'spin up environment')
+        if: |
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.create_resources == 'true') ||
+          (contains(github.event.pull_request.labels.*.name, 'stage') && contains(github.event.pull_request.labels.*.name, 'spin up environment'))
         run: |
           EXISTS=$(az group exists --name ${{env.AZURE_RESOURCE_GROUP}})
           if [ "$EXISTS" = true ]; then
@@ -104,8 +143,11 @@ jobs:
             az group create --location ${{env.AZURE_LOCATION}} --name ${{env.AZURE_RESOURCE_GROUP}} --subscription ${{secrets.AZURE_SUBSCRIPTION_ID}}
             echo "Resource group ${{env.AZURE_RESOURCE_GROUP}} created."
           fi
+
       - name: Create Azure app service plan
-        if: contains(github.event.pull_request.labels.*.name, 'stage') && contains(github.event.pull_request.labels.*.name, 'spin up environment')
+        if: |
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.create_resources == 'true') ||
+          (contains(github.event.pull_request.labels.*.name, 'stage') && contains(github.event.pull_request.labels.*.name, 'spin up environment'))
         run: |
           APP_SERVICE_PLAN_NAME=${{env.AZURE_APP_PLAN}}
           appservice_plans=$(az appservice plan list --resource-group ${{env.AZURE_RESOURCE_GROUP}} --query "[?name=='$APP_SERVICE_PLAN_NAME']")
@@ -117,7 +159,9 @@ jobs:
           fi
 
       - name: Create webapp resource
-        if: contains(github.event.pull_request.labels.*.name, 'stage') && contains(github.event.pull_request.labels.*.name, 'spin up environment')
+        if: |
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.create_resources == 'true') ||
+          (contains(github.event.pull_request.labels.*.name, 'stage') && contains(github.event.pull_request.labels.*.name, 'spin up environment'))
         run: |
           WEB_APP_NAME=${{ env.AZURE_WEBAPP_NAME }}
           web_apps=$(az webapp list --resource-group ${{env.AZURE_RESOURCE_GROUP}} --query "[?name=='$WEB_APP_NAME']")
@@ -138,15 +182,19 @@ jobs:
       - name: Check WebApp response code
         run: |
           webapp_url=$(az webapp show --name ${{ env.AZURE_WEBAPP_NAME }}  --resource-group ${{env.AZURE_RESOURCE_GROUP}} --query "defaultHostName" -o tsv)
+          echo "Testing webapp at: https://$webapp_url"
+          
+          # Give app time to start
+          sleep 30
+          
           response_code=$(curl --head --silent --output /dev/null --write-out "%{http_code}" --max-time 30 https://$webapp_url)
           if [ $response_code -eq 200 ]; then
-            echo "$webapp_url is working fine.Merging this pull request."
-            gh pr merge ${{ github.event.pull_request.number }} --squash --auto --delete-branch
+            echo "✅ $webapp_url is working fine (HTTP $response_code)"
+            echo "Deployment successful!"
           else
-            echo "Failed to ping $webapp_url"
+            echo "❌ Failed to ping $webapp_url (HTTP $response_code)"
+            exit 1
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Azure logout via Azure CLI
         uses: azure/CLI@v2
