@@ -126,7 +126,7 @@ jobs:
           if [[ $(echo "$appservice_plans" | jq length) -gt 0 ]]; then
             echo "App Service Plan '$APP_SERVICE_PLAN_NAME' exists in resource group ${{env.AZURE_RESOURCE_GROUP}}."
           else
-             az appservice plan create --resource-group ${{env.AZURE_RESOURCE_GROUP}} --name ${{env.AZURE_APP_PLAN}} --is-linux --sku B1 --subscription ${{secrets.AZURE_SUBSCRIPTION_ID}}
+             az appservice plan create --resource-group ${{env.AZURE_RESOURCE_GROUP}} --name ${{env.AZURE_APP_PLAN}} --is-linux --sku F1 --subscription ${{secrets.AZURE_SUBSCRIPTION_ID}}
             echo "App service plan ${{env.AZURE_APP_PLAN}} created."
           fi
 
